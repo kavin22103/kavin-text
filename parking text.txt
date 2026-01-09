@@ -1,0 +1,2026 @@
+app.py
+
+from flask import Flask, request, jsonify, render_template, redirect, url_for
+from flask_cors import CORS
+import sqlite3
+import json
+import os
+from datetime import datetime
+import qrcode
+from io import BytesIO
+import base64
+
+# ================= APP SETUP =================
+app = Flask(__name__)
+CORS(app)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATABASE = os.path.join(BASE_DIR, 'database', 'parking.db')
+os.makedirs(os.path.dirname(DATABASE), exist_ok=True)
+
+# ================= DATABASE =================
+def get_db_connection():
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    """Initialize all required tables"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Users table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone TEXT UNIQUE,
+            password TEXT,
+            full_name TEXT,
+            email TEXT
+        )
+    """)
+
+    # Vehicles table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS vehicles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            vehicle_number TEXT,
+            vehicle_type TEXT,
+            vehicle_model TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    """)
+
+    # Admin table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS admin (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            password TEXT
+        )
+    """)
+
+    # Bookings table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bookings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            vehicle_number TEXT,
+            slot_id TEXT,
+            entry_time TEXT,
+            exit_time TEXT,
+            amount REAL,
+            qr_data TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    """)
+
+    # Slots table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS slots (
+            id TEXT PRIMARY KEY,
+            status TEXT,
+            vehicle_type TEXT,
+            current_vehicle TEXT,
+            entry_time TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+# Initialize tables at startup
+init_db()
+
+# ================= FRONTEND ROUTES =================
+@app.route("/", endpoint='home')
+def home_page():
+    return render_template("index.html")
+
+@app.route("/user/login", endpoint='user_login')
+def user_login_page():
+    return render_template("user_login.html")
+
+@app.route("/user/register", endpoint='user_register')
+def register_page():
+    return render_template("register.html")
+
+@app.route("/admin/login", endpoint='admin_login')
+def admin_login_page():
+    return render_template("admin_login.html")
+
+@app.route("/dashboard", endpoint='dashboard')
+def dashboard_page():
+    return render_template("dashboard.html")
+
+@app.route("/gate/scanner", endpoint='gate_scanner')
+def gate_scanner_page():
+    return render_template("scanner.html")
+
+@app.route("/slots", endpoint="slots")
+def slots_page():
+    return render_template("slots.html")
+
+@app.route("/reports", endpoint="reports")
+def reports_page():
+    return render_template("reports.html")
+
+# ================= TEST API =================
+@app.route("/api/test")
+def test_api():
+    return jsonify({
+        "success": True,
+        "message": "QR Parking System API is running",
+        "timestamp": datetime.now().isoformat()
+    })
+
+# ================= USER APIs =================
+@app.route("/api/user/register", methods=["POST"])
+def user_register_api():
+    data = request.json
+    phone = data.get("phone")
+    password = data.get("password")
+    full_name = data.get("full_name")
+    email = data.get("email")
+    vehicle_number = data.get("vehicle_number")
+    vehicle_type = data.get("vehicle_type")
+    vehicle_model = data.get("vehicle_model")
+
+    if not all([phone, password, full_name, vehicle_number, vehicle_type]):
+        return jsonify({"success": False, "error": "Missing required fields"}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT id FROM users WHERE phone = ?", (phone,))
+    if cursor.fetchone():
+        conn.close()
+        return jsonify({"success": False, "error": "Phone already registered"}), 400
+
+    cursor.execute(
+        "INSERT INTO users (phone, password, full_name, email) VALUES (?, ?, ?, ?)",
+        (phone, password, full_name, email)
+    )
+    user_id = cursor.lastrowid
+
+    cursor.execute(
+        "INSERT INTO vehicles (user_id, vehicle_number, vehicle_type, vehicle_model) VALUES (?, ?, ?, ?)",
+        (user_id, vehicle_number, vehicle_type, vehicle_model)
+    )
+
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "user_id": user_id})
+
+@app.route("/api/user/login", methods=["POST"])
+def user_login_api():
+    data = request.json
+    phone = data.get("phone")
+    password = data.get("password")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, full_name, email FROM users WHERE phone = ? AND password = ?",
+        (phone, password)
+    )
+    user = cursor.fetchone()
+    conn.close()
+
+    if user:
+        return jsonify({"success": True, "user": dict(user)})
+    return jsonify({"success": False, "error": "Invalid credentials"}), 401
+
+# ================= BOOKING API =================
+@app.route("/api/user/create_booking", methods=["POST"])
+def create_booking_api():
+    data = request.json
+    user_id = data.get("user_id")
+    vehicle_number = data.get("vehicle_number")
+    slot_id = data.get("slot_id")
+    entry_time = datetime.now().isoformat()
+
+    booking_id = f"BK{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    qr_data = json.dumps({"booking_id": booking_id, "user_id": user_id, "vehicle_number": vehicle_number, "slot_id": slot_id})
+
+    qr = qrcode.make(qr_data)
+    buffer = BytesIO()
+    qr.save(buffer, format="PNG")
+    qr_base64 = base64.b64encode(buffer.getvalue()).decode()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO bookings (user_id, vehicle_number, slot_id, entry_time, qr_data) VALUES (?, ?, ?, ?, ?)",
+        (user_id, vehicle_number, slot_id, entry_time, qr_data)
+    )
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "success": True,
+        "booking_id": booking_id,
+        "qr_code": qr_base64
+    })
+
+# ================= GATE API =================
+@app.route("/api/gate/scan", methods=["POST"])
+def gate_scan_api():
+    data = request.json
+    booking_id = data.get("booking_id")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM bookings WHERE qr_data LIKE ?", (f'%{booking_id}%',))
+    booking = cursor.fetchone()
+    conn.close()
+
+    if booking:
+        return jsonify({"success": True, "booking": dict(booking)})
+    return jsonify({"success": False, "error": "Booking not found"}), 404
+
+# ================= ADMIN APIs =================
+@app.route("/api/admin/login", methods=["POST"])
+def admin_login_api():
+    data = request.json
+    username = data.get("username")
+    password = data.get("password")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id FROM admin WHERE username = ? AND password = ?",
+        (username, password)
+    )
+    admin = cursor.fetchone()
+    conn.close()
+
+    if admin:
+        return jsonify({"success": True})
+    return jsonify({"success": False, "error": "Invalid admin credentials"}), 401
+
+# ================= SLOTS APIs =================
+@app.route("/api/slots", methods=["GET"])
+def api_get_slots():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM slots")
+    slots = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return jsonify(slots)
+
+@app.route("/api/slots", methods=["POST"])
+def api_add_slot():
+    data = request.json
+    slot_id = data.get("id")
+    status = data.get("status", "available")
+    vehicle_type = data.get("vehicleType", "both")
+
+    if not slot_id:
+        return jsonify({"success": False, "message": "Slot ID required"}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO slots (id, status, vehicle_type) VALUES (?, ?, ?)", (slot_id, status, vehicle_type))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "message": f"Slot {slot_id} added successfully"})
+
+@app.route("/api/slots/<slot_id>", methods=["PUT"])
+def api_update_slot(slot_id):
+    data = request.json
+    status = data.get("status")
+    vehicle_type = data.get("vehicleType")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE slots SET status = ?, vehicle_type = ? WHERE id = ?", (status, vehicle_type, slot_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "message": f"Slot {slot_id} updated successfully"})
+
+@app.route("/api/slots/<slot_id>", methods=["DELETE"])
+def api_delete_slot(slot_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM slots WHERE id = ?", (slot_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "message": f"Slot {slot_id} deleted successfully"})
+
+# ================= BOOKINGS FOR REPORTS =================
+@app.route("/api/bookings", methods=["GET"])
+def api_get_bookings():
+    from_date = request.args.get("from")
+    to_date = request.args.get("to")
+
+    query = "SELECT * FROM bookings WHERE 1=1"
+    params = []
+
+    if from_date:
+        query += " AND entry_time >= ?"
+        params.append(from_date)
+    if to_date:
+        query += " AND entry_time <= ?"
+        params.append(to_date)
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(query, params)
+    bookings = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return jsonify(bookings)
+
+# ================= START SERVER =================
+if __name__ == "__main__":
+    print("====================================")
+    print(" QR Parking System Running")
+    print(" http://127.0.0.1:5000")
+    print("====================================")
+    app.run(debug=True)
+
+bookig.html
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Book Parking - QR Parking</title>
+
+<!-- CSS -->
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+<style>
+/* Booking CSS */
+.booking-steps { display:flex; justify-content:center; margin-bottom:2rem; gap:2rem; }
+.step { text-align:center; flex:1; max-width:200px; }
+.step-number { width:40px; height:40px; background-color: var(--gray); color:white; border-radius:50%; display:flex; align-items:center; justify-content:center; margin:0 auto 10px; }
+.step.active .step-number { background-color: var(--secondary); }
+.slot-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px,1fr)); gap:1rem; margin:1rem 0; }
+.slot { padding:1rem; text-align:center; border-radius:5px; cursor:pointer; transition:all 0.3s; }
+.slot.available { background-color:#d4edda; border:2px solid #27ae60; }
+.slot.occupied { background-color:#f8d7da; border:2px solid #e74c3c; cursor:not-allowed; }
+.slot.selected { background-color:#d6eaf8; border:2px solid #3498db; transform:scale(1.05); }
+.slot.reserved { background-color:#fff3cd; border:2px solid #f39c12; cursor:not-allowed; }
+.qr-code-container { text-align:center; padding:2rem; }
+#qrCode { max-width:300px; margin:1rem auto; }
+</style>
+</head>
+<body>
+
+<!-- Redirect if user not logged in -->
+<script>
+if(localStorage.getItem('userLoggedIn') !== 'true') {
+    window.location.href = "{{ url_for('user_login') }}";
+}
+</script>
+
+<!-- ================= NAVBAR ================= -->
+<nav class="navbar">
+<div class="nav-container">
+    <div class="logo">
+        <i class="fas fa-qrcode"></i>
+        <h1>QR-PARKING</h1>
+    </div>
+    <ul class="nav-menu">
+        <li><a href="{{ url_for('home') }}">Home</a></li>
+        <li><a href="{{ url_for('user_login') }}">Logout</a></li>
+        <li><a href="{{ url_for('dashboard') }}" class="active">Book Parking</a></li>
+    </ul>
+</div>
+</nav>
+
+<!-- ================= BOOKING FORM ================= -->
+<div class="container">
+    <div class="card">
+        <h2 class="card-title">Book Your Parking Slot</h2>
+
+        <div class="booking-steps">
+            <div class="step active" id="step1"><div class="step-number">1</div><h4>Select Date & Time</h4></div>
+            <div class="step" id="step2"><div class="step-number">2</div><h4>Choose Slot</h4></div>
+            <div class="step" id="step3"><div class="step-number">3</div><h4>Confirm & Get QR</h4></div>
+        </div>
+
+        <!-- Step 1 -->
+        <div id="step1Content">
+            <div class="form-group">
+                <label for="bookingDate"><i class="fas fa-calendar"></i> Date</label>
+                <input type="date" id="bookingDate" class="form-control" required>
+            </div>
+            <div class="form-group">
+                <label for="entryTime"><i class="fas fa-clock"></i> Entry Time</label>
+                <input type="time" id="entryTime" class="form-control" required>
+            </div>
+            <div class="form-group">
+                <label for="duration"><i class="fas fa-hourglass"></i> Duration</label>
+                <select id="duration" class="form-control" required>
+                    <option value="1">1 hour</option>
+                    <option value="2">2 hours</option>
+                    <option value="3">3 hours</option>
+                    <option value="5">5 hours</option>
+                    <option value="8">8 hours</option>
+                    <option value="24">24 hours</option>
+                </select>
+            </div>
+            <button onclick="nextStep(2)" class="btn btn-primary">Check Available Slots</button>
+        </div>
+
+        <!-- Step 2 -->
+        <div id="step2Content" style="display:none;">
+            <h3>Available Slots</h3>
+            <p>Select a parking slot (Green = Available, Red = Occupied, Yellow = Reserved)</p>
+            <div class="slot-grid" id="slotsGrid"></div>
+            <div style="margin-top:2rem;">
+                <button onclick="prevStep(1)" class="btn btn-secondary">Back</button>
+                <button onclick="nextStep(3)" class="btn btn-primary" id="confirmSlotBtn" disabled>Confirm Slot</button>
+            </div>
+        </div>
+
+        <!-- Step 3 -->
+        <div id="step3Content" style="display:none;">
+            <h3>Booking Confirmation</h3>
+            <div class="qr-code-container">
+                <p>Your booking has been confirmed! Present this QR code at the gate:</p>
+                <div id="qrCode"></div>
+                <div id="bookingDetails" style="margin-top:1rem;"></div>
+                <button onclick="printQR()" class="btn btn-primary" style="margin-top:1rem;">
+                    <i class="fas fa-print"></i> Print QR Code
+                </button>
+            </div>
+            <div style="margin-top:2rem;">
+                <button onclick="prevStep(2)" class="btn btn-secondary">Back</button>
+                <button onclick="newBooking()" class="btn btn-primary">Make Another Booking</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ================= FOOTER ================= -->
+<footer class="footer">
+<div class="footer-content">
+    <p>&copy; 2025 QR Parking System. All rights reserved.</p>
+</div>
+</footer>
+
+<!-- ================= SCRIPT ================= -->
+<script>
+let selectedSlot = null;
+let bookingData = {};
+
+function generateSlots() {
+    const slotsGrid = document.getElementById('slotsGrid');
+    slotsGrid.innerHTML = '';
+    const slotStatus = ['available','occupied','available','reserved','available','occupied','available','available','occupied','available'];
+    for(let i=1;i<=10;i++){
+        const slotDiv = document.createElement('div');
+        slotDiv.className = `slot ${slotStatus[i-1]}`;
+        slotDiv.innerHTML = `<h4>A-${i}</h4><p>${slotStatus[i-1][0].toUpperCase() + slotStatus[i-1].slice(1)}</p>`;
+        if(slotStatus[i-1]==='available') slotDiv.onclick = ()=>selectSlot(i, slotDiv);
+        slotsGrid.appendChild(slotDiv);
+    }
+}
+
+function selectSlot(slotNumber, element){
+    document.querySelectorAll('.slot.selected').forEach(s=>s.classList.remove('selected'));
+    selectedSlot = slotNumber;
+    element.classList.add('selected');
+    document.getElementById('confirmSlotBtn').disabled=false;
+}
+
+async function nextStep(step){
+    document.getElementById('step1Content').style.display='none';
+    document.getElementById('step2Content').style.display='none';
+    document.getElementById('step3Content').style.display='none';
+    document.querySelectorAll('.step').forEach(s=>s.classList.remove('active'));
+    document.getElementById(`step${step}Content`).style.display='block';
+    document.getElementById(`step${step}`).classList.add('active');
+
+    if(step===2){
+        generateSlots();
+        bookingData.date = document.getElementById('bookingDate').value;
+        bookingData.entryTime = document.getElementById('entryTime').value;
+        bookingData.duration = document.getElementById('duration').value;
+        bookingData.userPhone = localStorage.getItem('userPhone');
+    }
+
+    if(step===3 && selectedSlot){
+        bookingData.slot = `A-${selectedSlot}`;
+        try {
+            const res = await fetch('{{ url_for("user_register_api") }}'.replace('user_register_api','create_booking_api'),{
+                method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body: JSON.stringify(bookingData)
+            });
+            const data = await res.json();
+            bookingData.bookingId = data.booking_id;
+            // Display booking
+            document.getElementById('bookingDetails').innerHTML=`
+                <p><strong>Booking ID:</strong> ${bookingData.bookingId}</p>
+                <p><strong>Date:</strong> ${bookingData.date}</p>
+                <p><strong>Entry Time:</strong> ${bookingData.entryTime}</p>
+                <p><strong>Duration:</strong> ${bookingData.duration} hours</p>
+                <p><strong>Slot:</strong> ${bookingData.slot}</p>
+            `;
+            document.getElementById('qrCode').innerHTML=`<img src="data:image/png;base64,${data.qr_code}" />`;
+        } catch(err){ alert('Error creating booking'); console.error(err); }
+    }
+}
+
+function prevStep(step){ nextStep(step); }
+function printQR(){ window.print(); }
+function newBooking(){ selectedSlot=null; bookingData={}; document.getElementById('bookingDate').value=''; document.getElementById('entryTime').value=''; document.getElementById('duration').value='1'; nextStep(1);}
+window.onload=function(){document.getElementById('bookingDate').value=new Date().toISOString().split('T')[0];}
+</script>
+</body>
+</html>
+
+dashboard.html
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Dashboard - QR Parking</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        .chart-container {
+            background: white;
+            border-radius: 10px;
+            padding: 1rem;
+            box-shadow: var(--shadow);
+            margin-bottom: 2rem;
+        }
+        .chart-placeholder {
+            height: 300px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #f8f9fa;
+            border-radius: 5px;
+            color: var(--gray);
+        }
+        .quick-actions {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 1rem;
+            margin: 1rem 0;
+        }
+        .action-btn {
+            background: var(--secondary);
+            color: white;
+            padding: 1rem;
+            border-radius: 5px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .action-btn:hover {
+            background: #2980b9;
+            transform: translateY(-2px);
+        }
+        .recent-activity {
+            background: white;
+            border-radius: 10px;
+            padding: 1rem;
+            box-shadow: var(--shadow);
+        }
+        .activity-item {
+            padding: 0.5rem 0;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .activity-item:last-child {
+            border-bottom: none;
+        }
+    </style>
+</head>
+<body>
+    <!-- Check if admin is logged in -->
+    <script>
+        if(localStorage.getItem('adminLoggedIn') !== 'true') {
+            window.location.href = 'login.html';
+        }
+    </script>
+
+    <div class="dashboard">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div style="padding: 2rem; text-align: center;">
+                <i class="fas fa-user-shield" style="font-size: 3rem; margin-bottom: 1rem;"></i>
+                <h3>Admin Panel</h3>
+            </div>
+            <ul class="sidebar-menu">
+               <li>
+  <a href="{{ url_for('dashboard') }}" class="active">
+    <i class="fas fa-tachometer-alt"></i> Dashboard
+  </a>
+</li>
+
+<li>
+  <a href="{{ url_for('slots') }}">
+    <i class="fas fa-car"></i> Slot Management
+  </a>
+</li>
+
+<li>
+  <a href="{{ url_for('reports') }}">
+    <i class="fas fa-chart-bar"></i> Reports
+  </a>
+</li>
+
+                <li><a href="#" onclick="logout()"><i class="fas fa-sign-out-alt"></i> Logout</a></li>
+            </ul>
+        </div>
+
+        <!-- Main Content -->
+        <div class="main-content">
+            <h1>Admin Dashboard</h1>
+            <p>Welcome to the QR Parking Management System Admin Panel</p>
+            
+            <!-- Stats Grid -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <i class="fas fa-car"></i>
+                    <h3>Total Vehicles Today</h3>
+                    <p class="stat-number" id="totalVehicles">42</p>
+                </div>
+                <div class="stat-card">
+                    <i class="fas fa-parking"></i>
+                    <h3>Available Slots</h3>
+                    <p class="stat-number" id="availableSlots">18</p>
+                </div>
+                <div class="stat-card">
+                    <i class="fas fa-money-bill-wave"></i>
+                    <h3>Today's Revenue</h3>
+                    <p class="stat-number">₹1,250</p>
+                </div>
+                <div class="stat-card">
+                    <i class="fas fa-users"></i>
+                    <h3>Active Users</h3>
+                    <p class="stat-number">156</p>
+                </div>
+            </div>
+
+            <!-- Quick Actions -->
+            <h2 style="margin: 2rem 0 1rem 0;">Quick Actions</h2>
+            <div class="quick-actions">
+                <div class="action-btn" onclick="window.location.href='slots.html'">
+                    <i class="fas fa-edit fa-2x"></i>
+                    <p>Manage Slots</p>
+                </div>
+                <div class="action-btn" onclick="window.location.href='reports.html'">
+                    <i class="fas fa-file-alt fa-2x"></i>
+                    <p>Generate Reports</p>
+                </div>
+                <div class="action-btn" onclick="addNewSlot()">
+                    <i class="fas fa-plus-circle fa-2x"></i>
+                    <p>Add New Slot</p>
+                </div>
+                <div class="action-btn" onclick="viewUsers()">
+                    <i class="fas fa-users fa-2x"></i>
+                    <p>View Users</p>
+                </div>
+            </div>
+
+            <!-- Charts -->
+            <h2 style="margin: 2rem 0 1rem 0;">Parking Analytics</h2>
+            <div class="chart-container">
+                <h3>Hourly Occupancy</h3>
+                <div class="chart-placeholder">
+                    <p>Hourly occupancy chart would be displayed here</p>
+                </div>
+            </div>
+
+            <!-- Recent Activity -->
+            <div class="recent-activity">
+                <h3>Recent Activity</h3>
+                <div class="activity-item">
+                    <i class="fas fa-car text-success"></i>
+                    <span>Vehicle KA01AB1234 entered at 10:30 AM</span>
+                </div>
+                <div class="activity-item">
+                    <i class="fas fa-car text-danger"></i>
+                    <span>Vehicle MH02CD5678 exited at 11:15 AM</span>
+                </div>
+                <div class="activity-item">
+                    <i class="fas fa-qrcode text-primary"></i>
+                    <span>New booking created for Slot A-5</span>
+                </div>
+                <div class="activity-item">
+                    <i class="fas fa-user-plus text-info"></i>
+                    <span>New user registered (Phone: 9876543210)</span>
+                </div>
+                <div class="activity-item">
+                    <i class="fas fa-money-check-alt text-warning"></i>
+                    <span>Payment received: ₹120 for booking BK123456</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function logout() {
+            localStorage.removeItem('adminLoggedIn');
+            window.location.href = 'login.html';
+        }
+        
+        function addNewSlot() {
+            const slotName = prompt('Enter new slot name (e.g., B-1):');
+            if(slotName) {
+                alert(`Slot ${slotName} added successfully!`);
+                // In real app, make API call to add slot
+            }
+        }
+        
+        function viewUsers() {
+            // Get user data from localStorage (in real app, from API)
+            const userData = JSON.parse(localStorage.getItem('userData') || '{}');
+            if(Object.keys(userData).length === 0) {
+                alert('No user data found. Demo: Check localStorage for userData');
+            } else {
+                alert(`User Details:\nName: ${userData.fullName}\nPhone: ${userData.phone}\nVehicle: ${userData.vehicleNumber}`);
+            }
+        }
+        
+        // Update stats (simulated)
+        function updateStats() {
+            // In real app, these would come from API
+            const totalSlots = 30;
+            const occupied = Math.floor(Math.random() * 20) + 5;
+            document.getElementById('availableSlots').textContent = totalSlots - occupied;
+            document.getElementById('totalVehicles').textContent = occupied + Math.floor(Math.random() * 10);
+        }
+        
+        // Update stats every 30 seconds
+        updateStats();
+        setInterval(updateStats, 30000);
+    </script>
+</body>
+</html>
+
+manual.html
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Manual Entry - QR Parking</title>
+
+<!-- CSS -->
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+<style>
+.manual-container { max-width: 600px; margin: 2rem auto; padding: 0 1rem; }
+.toggle-buttons { display: flex; gap: 1rem; margin-bottom: 2rem; }
+.toggle-btn {
+    flex: 1;
+    padding: 1rem;
+    text-align: center;
+    background: #f8f9fa;
+    border: 2px solid #ddd;
+    border-radius: 5px;
+    cursor: pointer;
+    font-weight: bold;
+    transition: all 0.3s;
+}
+.toggle-btn.active {
+    background: var(--secondary);
+    color: white;
+    border-color: var(--secondary);
+}
+.manual-form { display: none; }
+.manual-form.active { display: block; }
+.search-results {
+    margin-top: 2rem;
+    background: white;
+    border-radius: 10px;
+    padding: 1rem;
+    box-shadow: var(--shadow);
+}
+.result-item { padding: 1rem; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
+.result-item:last-child { border-bottom: none; }
+.status-occupied { color: red; font-weight: bold; }
+.status-available { color: green; font-weight: bold; }
+</style>
+</head>
+<body>
+
+<!-- Navbar -->
+<nav class="navbar">
+<div class="nav-container">
+    <div class="logo">
+        <i class="fas fa-qrcode"></i>
+        <h1>MANUAL ENTRY</h1>
+    </div>
+    <ul class="nav-menu">
+        <li><a href="{{ url_for('home') }}">Home</a></li>
+        <li><a href="{{ url_for('gate_scanner') }}">Scanner</a></li>
+        <li><a href="{{ url_for('manual_entry_page') }}" class="active">Manual Entry</a></li>
+        <li><a href="{{ url_for('admin_login') }}">Admin</a></li>
+    </ul>
+</div>
+</nav>
+
+<div class="manual-container">
+    <h1 style="text-align: center;">Manual Entry/Exit</h1>
+    <p style="text-align: center; color: var(--gray);">Use this when QR scanning is not available</p>
+
+    <div class="toggle-buttons">
+        <div class="toggle-btn active" onclick="showForm('entry', event)">Entry</div>
+        <div class="toggle-btn" onclick="showForm('exit', event)">Exit</div>
+        <div class="toggle-btn" onclick="showForm('search', event)">Search</div>
+    </div>
+
+    <!-- Entry Form -->
+    <div id="entryForm" class="manual-form active card">
+        <h2 class="card-title">Manual Entry</h2>
+        <form id="manualEntryForm">
+            <div class="form-group">
+                <label for="vehicleNumberEntry"><i class="fas fa-car"></i> Vehicle Number</label>
+                <input type="text" id="vehicleNumberEntry" class="form-control" placeholder="Enter vehicle number" required>
+            </div>
+            <div class="form-group">
+                <label for="vehicleTypeEntry"><i class="fas fa-car-side"></i> Vehicle Type</label>
+                <select id="vehicleTypeEntry" class="form-control" required>
+                    <option value="">Select type</option>
+                    <option value="Two-wheeler">Two-wheeler</option>
+                    <option value="Four-wheeler">Four-wheeler</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="slotEntry"><i class="fas fa-parking"></i> Assign Slot</label>
+                <select id="slotEntry" class="form-control" required>
+                    <option value="">Select slot</option>
+                    <option value="A-1">A-1 (Available)</option>
+                    <option value="A-3">A-3 (Available)</option>
+                    <option value="A-7">A-7 (Available)</option>
+                    <option value="A-9">A-9 (Available)</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="phoneEntry"><i class="fas fa-phone"></i> Phone Number (Optional)</label>
+                <input type="tel" id="phoneEntry" class="form-control" placeholder="Enter phone number">
+            </div>
+            <button type="submit" class="btn btn-primary" style="width: 100%;">Process Entry</button>
+        </form>
+    </div>
+
+    <!-- Exit Form -->
+    <div id="exitForm" class="manual-form card">
+        <h2 class="card-title">Manual Exit</h2>
+        <form id="manualExitForm">
+            <div class="form-group">
+                <label for="vehicleNumberExit"><i class="fas fa-car"></i> Vehicle Number</label>
+                <input type="text" id="vehicleNumberExit" class="form-control" placeholder="Enter vehicle number" required>
+            </div>
+            <div class="form-group">
+                <label for="slotExit"><i class="fas fa-parking"></i> Slot Number</label>
+                <input type="text" id="slotExit" class="form-control" placeholder="Enter slot number">
+            </div>
+            <div class="form-group">
+                <label for="entryTimeExit"><i class="fas fa-clock"></i> Entry Time (If known)</label>
+                <input type="datetime-local" id="entryTimeExit" class="form-control">
+            </div>
+            <button type="submit" class="btn btn-danger" style="width: 100%;">Process Exit & Calculate Fee</button>
+        </form>
+    </div>
+
+    <!-- Search Form -->
+    <div id="searchForm" class="manual-form card">
+        <h2 class="card-title">Search Vehicle</h2>
+        <form id="searchFormElement">
+            <div class="form-group">
+                <label for="searchQuery"><i class="fas fa-search"></i> Search by Vehicle Number or Phone</label>
+                <input type="text" id="searchQuery" class="form-control" placeholder="Enter vehicle number or phone" required>
+            </div>
+            <button type="submit" class="btn btn-secondary" style="width: 100%;">Search</button>
+        </form>
+        <div id="searchResults" class="search-results" style="display: none;">
+            <h3>Search Results</h3>
+            <div id="resultsContainer"></div>
+        </div>
+    </div>
+
+    <!-- Result Display -->
+    <div id="resultDisplay" class="card" style="display: none; margin-top: 2rem;">
+        <h2 class="card-title" id="resultTitle"></h2>
+        <div id="resultContent"></div>
+        <div id="actionButtons" style="margin-top: 1rem;"></div>
+    </div>
+</div>
+
+<footer class="footer">
+<div class="footer-content">
+    <p>&copy; 2025 QR Parking System. All rights reserved.</p>
+</div>
+</footer>
+
+<script>
+function showForm(formType, event) {
+    document.querySelectorAll('.toggle-btn').forEach(btn => btn.classList.remove('active'));
+    event.currentTarget.classList.add('active');
+
+    document.querySelectorAll('.manual-form').forEach(form => form.classList.remove('active'));
+    document.getElementById('resultDisplay').style.display = 'none';
+    document.getElementById('searchResults').style.display = 'none';
+
+    document.getElementById(formType + 'Form').classList.add('active');
+}
+
+// Entry Handler
+document.getElementById('manualEntryForm').addEventListener('submit', async function(e) {
+    e.preventDefault();
+    const vehicleNumber = document.getElementById('vehicleNumberEntry').value;
+    const vehicleType = document.getElementById('vehicleTypeEntry').value;
+    const slot = document.getElementById('slotEntry').value;
+    const phone = document.getElementById('phoneEntry').value;
+
+    const entryData = { vehicle_number: vehicleNumber, vehicle_type: vehicleType, slot_id: slot, phone };
+
+    try {
+        const res = await fetch("{{ url_for('api_gate_scan') }}", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(entryData)
+        });
+        const data = await res.json();
+        displayResult('Entry Processed', `
+            <p><strong>Vehicle:</strong> ${vehicleNumber}</p>
+            <p><strong>Type:</strong> ${vehicleType}</p>
+            <p><strong>Slot Assigned:</strong> ${slot}</p>
+            <p><strong>Phone:</strong> ${phone || 'Not provided'}</p>
+        `, `
+            <button onclick="resetForm('entry')" class="btn btn-secondary"><i class="fas fa-redo"></i> New Entry</button>
+        `);
+    } catch(err) {
+        alert('Error processing entry'); console.error(err);
+    }
+});
+
+// Utility
+function displayResult(title, contentHTML, buttonsHTML) {
+    document.getElementById('resultTitle').innerHTML = title;
+    document.getElementById('resultContent').innerHTML = contentHTML;
+    document.getElementById('actionButtons').innerHTML = buttonsHTML;
+    document.getElementById('resultDisplay').style.display = 'block';
+}
+
+function resetForm(formType) {
+    document.getElementById(formType + 'Form').reset();
+    document.getElementById('resultDisplay').style.display = 'none';
+}
+</script>
+
+</body>
+</html>
+
+register.html
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>User Registration - QR Parking</title>
+
+<!-- CSS -->
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+
+<nav class="navbar">
+    <div class="nav-container">
+        <div class="logo">
+            <i class="fas fa-qrcode"></i>
+            <h1>QR-PARKING</h1>
+        </div>
+        <ul class="nav-menu">
+            <li><a href="{{ url_for('home') }}">Home</a></li>
+            <li><a href="{{ url_for('user_login') }}">User Login</a></li>
+            <li><a href="{{ url_for('user_register') }}" class="active">Register</a></li>
+        </ul>
+    </div>
+</nav>
+
+<div class="container">
+    <div class="card">
+        <h2 class="card-title">User Registration</h2>
+        <form id="registerForm">
+            <div class="form-group">
+                <label for="fullName"><i class="fas fa-user"></i> Full Name</label>
+                <input type="text" id="fullName" class="form-control" placeholder="Enter your full name" required>
+            </div>
+            <div class="form-group">
+                <label for="phone"><i class="fas fa-phone"></i> Phone Number</label>
+                <input type="tel" id="phone" class="form-control" placeholder="Enter your phone number" required>
+            </div>
+            <div class="form-group">
+                <label for="email"><i class="fas fa-envelope"></i> Email Address</label>
+                <input type="email" id="email" class="form-control" placeholder="Enter your email" required>
+            </div>
+            <div class="form-group">
+                <label for="password"><i class="fas fa-lock"></i> Password</label>
+                <input type="password" id="password" class="form-control" placeholder="Create a password" required>
+            </div>
+            <div class="form-group">
+                <label for="confirmPassword"><i class="fas fa-lock"></i> Confirm Password</label>
+                <input type="password" id="confirmPassword" class="form-control" placeholder="Confirm your password" required>
+            </div>
+            
+            <h3 style="margin: 1.5rem 0; color: var(--primary);">Vehicle Information</h3>
+            <div class="form-group">
+                <label for="vehicleNumber"><i class="fas fa-car"></i> Vehicle Number</label>
+                <input type="text" id="vehicleNumber" class="form-control" placeholder="Enter vehicle registration number" required>
+            </div>
+            <div class="form-group">
+                <label for="vehicleType"><i class="fas fa-car-side"></i> Vehicle Type</label>
+                <select id="vehicleType" class="form-control" required>
+                    <option value="">Select vehicle type</option>
+                    <option value="Two-wheeler">Two-wheeler</option>
+                    <option value="Four-wheeler">Four-wheeler</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="vehicleModel"><i class="fas fa-cog"></i> Vehicle Model</label>
+                <input type="text" id="vehicleModel" class="form-control" placeholder="Enter vehicle model (e.g., Honda City)" required>
+            </div>
+            
+            <button type="submit" class="btn btn-primary" style="width: 100%;">Register</button>
+        </form>
+        <div style="text-align: center; margin-top: 1rem;">
+            <p>Already have an account? 
+                <a href="{{ url_for('user_login') }}">Login here</a>
+            </p>
+        </div>
+    </div>
+</div>
+
+<footer class="footer">
+    <div class="footer-content">
+        <p>&copy; 2025 QR Parking System. All rights reserved.</p>
+    </div>
+</footer>
+
+<script>
+document.getElementById('registerForm').addEventListener('submit', async function(e) {
+    e.preventDefault();
+
+    const password = document.getElementById('password').value;
+    const confirmPassword = document.getElementById('confirmPassword').value;
+    if(password !== confirmPassword) {
+        alert('Passwords do not match!');
+        return;
+    }
+
+    const userData = {
+        full_name: document.getElementById('fullName').value,
+        phone: document.getElementById('phone').value,
+        email: document.getElementById('email').value,
+        password: password,
+        vehicle_number: document.getElementById('vehicleNumber').value,
+        vehicle_type: document.getElementById('vehicleType').value,
+        vehicle_model: document.getElementById('vehicleModel').value
+    };
+
+    try {
+        const res = await fetch("{{ url_for('api_user_register') }}", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(userData)
+        });
+        const data = await res.json();
+
+        if(data.success) {
+            // Store session info
+            localStorage.setItem('userLoggedIn', 'true');
+            localStorage.setItem('userPhone', userData.phone);
+
+            alert('Registration successful! Redirecting to booking page...');
+            window.location.href = "{{ url_for('booking') }}";
+        } else {
+            alert(data.message || 'Registration failed');
+        }
+    } catch(err) {
+        console.error(err);
+        alert('Error registering user');
+    }
+});
+</script>
+
+</body>
+</html>
+
+reports.html
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reports - QR Parking</title>
+    <!-- Flask static CSS -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        .report-filters {
+            background: white;
+            padding: 1rem;
+            border-radius: 10px;
+            box-shadow: var(--shadow);
+            margin-bottom: 2rem;
+        }
+        .filter-group {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 1rem;
+        }
+        .report-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+        .report-card {
+            background: white;
+            padding: 1.5rem;
+            border-radius: 10px;
+            box-shadow: var(--shadow);
+        }
+        .report-card h3 {
+            color: var(--primary);
+            margin-bottom: 1rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 2px solid var(--secondary);
+        }
+        .chart-placeholder-small {
+            height: 200px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #f8f9fa;
+            border-radius: 5px;
+            color: var(--gray);
+            margin: 1rem 0;
+        }
+        .export-options {
+            display: flex;
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+    </style>
+</head>
+<body>
+    <!-- Check if admin is logged in -->
+    <script>
+        if(localStorage.getItem('adminLoggedIn') !== 'true') {
+            window.location.href = "{{ url_for('admin_login') }}";
+        }
+    </script>
+
+    <div class="dashboard">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div style="padding: 2rem; text-align: center;">
+                <i class="fas fa-user-shield" style="font-size: 3rem; margin-bottom: 1rem;"></i>
+                <h3>Admin Panel</h3>
+            </div>
+            <ul class="sidebar-menu">
+                <li><a href="{{ url_for('dashboard') }}"><i class="fas fa-tachometer-alt"></i> Dashboard</a></li>
+                <li><a href="{{ url_for('slot_management') }}"><i class="fas fa-car"></i> Slot Management</a></li>
+                <li><a href="{{ url_for('reports') }}" class="active"><i class="fas fa-chart-bar"></i> Reports</a></li>
+                <li><a href="#" onclick="logout()"><i class="fas fa-sign-out-alt"></i> Logout</a></li>
+            </ul>
+        </div>
+
+        <!-- Main Content -->
+        <div class="main-content">
+            <h1>Reports & Analytics</h1>
+            <p>Generate detailed reports and view parking analytics</p>
+            
+            <!-- Filters -->
+            <div class="report-filters">
+                <h3>Filter Reports</h3>
+                <div class="filter-group">
+                    <div class="form-group">
+                        <label>Report Type</label>
+                        <select id="reportType" class="form-control">
+                            <option value="daily">Daily Report</option>
+                            <option value="weekly">Weekly Report</option>
+                            <option value="monthly">Monthly Report</option>
+                            <option value="custom">Custom Period</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>From Date</label>
+                        <input type="date" id="fromDate" class="form-control">
+                    </div>
+                    <div class="form-group">
+                        <label>To Date</label>
+                        <input type="date" id="toDate" class="form-control">
+                    </div>
+                </div>
+                <button onclick="generateReport()" class="btn btn-primary">Generate Report</button>
+            </div>
+            
+            <!-- Report Cards -->
+            <div class="report-cards">
+                <div class="report-card">
+                    <h3>Revenue Summary</h3>
+                    <div class="chart-placeholder-small">
+                        Revenue Chart
+                    </div>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+                        <div>
+                            <p style="color: var(--gray); font-size: 0.9rem;">Today</p>
+                            <p style="font-size: 1.5rem; font-weight: bold; color: var(--success);">₹1,250</p>
+                        </div>
+                        <div>
+                            <p style="color: var(--gray); font-size: 0.9rem;">This Month</p>
+                            <p style="font-size: 1.5rem; font-weight: bold; color: var(--primary);">₹28,500</p>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="report-card">
+                    <h3>Parking Utilization</h3>
+                    <div class="chart-placeholder-small">
+                        Utilization Chart
+                    </div>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+                        <div>
+                            <p style="color: var(--gray); font-size: 0.9rem;">Peak Hours</p>
+                            <p style="font-size: 1.5rem; font-weight: bold; color: var(--warning);">10 AM - 2 PM</p>
+                        </div>
+                        <div>
+                            <p style="color: var(--gray); font-size: 0.9rem;">Avg. Duration</p>
+                            <p style="font-size: 1.5rem; font-weight: bold; color: var(--secondary);">3.2 hrs</p>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="report-card">
+                    <h3>Vehicle Statistics</h3>
+                    <div class="chart-placeholder-small">
+                        Vehicle Chart
+                    </div>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+                        <div>
+                            <p style="color: var(--gray); font-size: 0.9rem;">Two Wheelers</p>
+                            <p style="font-size: 1.5rem; font-weight: bold; color: #3498db;">42%</p>
+                        </div>
+                        <div>
+                            <p style="color: var(--gray); font-size: 0.9rem;">Four Wheelers</p>
+                            <p style="font-size: 1.5rem; font-weight: bold; color: #e74c3c;">58%</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Detailed Report Table -->
+            <div style="background: white; border-radius: 10px; padding: 1rem; box-shadow: var(--shadow);">
+                <h2>Detailed Report</h2>
+                <div class="export-options">
+                    <button onclick="exportToPDF()" class="btn btn-danger">
+                        <i class="fas fa-file-pdf"></i> Export as PDF
+                    </button>
+                    <button onclick="exportToExcel()" class="btn btn-success">
+                        <i class="fas fa-file-excel"></i> Export as Excel
+                    </button>
+                    <button onclick="printReport()" class="btn btn-secondary">
+                        <i class="fas fa-print"></i> Print Report
+                    </button>
+                </div>
+                
+                <div class="table-container" style="margin-top: 1rem;">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Date</th>
+                                <th>Vehicle No.</th>
+                                <th>Slot</th>
+                                <th>Entry Time</th>
+                                <th>Exit Time</th>
+                                <th>Duration</th>
+                                <th>Amount</th>
+                                <th>Payment Mode</th>
+                            </tr>
+                        </thead>
+                        <tbody id="reportTableBody">
+                            <!-- Report data will be populated here -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const reportData = [
+            {date: '2025-12-28', vehicle: 'KA01AB1234', slot: 'A-2', entry: '10:30 AM', exit: '12:45 PM', duration: '2h 15m', amount: '₹120', payment: 'UPI'},
+            {date: '2025-12-28', vehicle: 'MH02CD5678', slot: 'A-5', entry: '9:15 AM', exit: '2:30 PM', duration: '5h 15m', amount: '₹250', payment: 'Cash'},
+            {date: '2025-12-27', vehicle: 'DL03EF9012', slot: 'A-8', entry: '11:45 AM', exit: '4:20 PM', duration: '4h 35m', amount: '₹210', payment: 'Card'},
+            {date: '2025-12-27', vehicle: 'TN04GH3456', slot: 'A-3', entry: '2:00 PM', exit: '5:30 PM', duration: '3h 30m', amount: '₹180', payment: 'UPI'},
+        ];
+
+        function renderReportTable(data = reportData) {
+            const tbody = document.getElementById('reportTableBody');
+            tbody.innerHTML = '';
+            data.forEach(item => {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>${item.date}</td>
+                    <td>${item.vehicle}</td>
+                    <td>${item.slot}</td>
+                    <td>${item.entry}</td>
+                    <td>${item.exit}</td>
+                    <td>${item.duration}</td>
+                    <td>${item.amount}</td>
+                    <td>${item.payment}</td>
+                `;
+                tbody.appendChild(row);
+            });
+        }
+
+        function generateReport() {
+            const reportType = document.getElementById('reportType').value;
+            const fromDate = document.getElementById('fromDate').value;
+            const toDate = document.getElementById('toDate').value;
+            
+            let filteredData = [...reportData];
+            if(fromDate && toDate) {
+                filteredData = reportData.filter(item => item.date >= fromDate && item.date <= toDate);
+            }
+            
+            if(reportType === 'daily') {
+                const today = new Date().toISOString().split('T')[0];
+                filteredData = reportData.filter(item => item.date === today);
+            } else if(reportType === 'weekly') {
+                const weekAgo = new Date();
+                weekAgo.setDate(weekAgo.getDate() - 7);
+                const weekAgoStr = weekAgo.toISOString().split('T')[0];
+                filteredData = reportData.filter(item => item.date >= weekAgoStr);
+            } else if(reportType === 'monthly') {
+                const currentMonth = new Date().toISOString().substring(0, 7);
+                filteredData = reportData.filter(item => item.date.startsWith(currentMonth));
+            }
+            
+            renderReportTable(filteredData);
+            alert(`Report generated: ${filteredData.length} records found`);
+        }
+
+        function exportToPDF() { alert('PDF export placeholder'); }
+        function exportToExcel() { alert('Excel export placeholder'); }
+        function printReport() { window.print(); }
+
+        function logout() {
+            localStorage.removeItem('adminLoggedIn');
+            window.location.href = "{{ url_for('admin_login') }}";
+        }
+
+        window.onload = function() {
+            renderReportTable();
+            const today = new Date().toISOString().split('T')[0];
+            const weekAgo = new Date(); weekAgo.setDate(weekAgo.getDate() - 7);
+            document.getElementById('fromDate').value = weekAgo.toISOString().split('T')[0];
+            document.getElementById('toDate').value = today;
+        };
+    </script>
+</body>
+</html>
+
+scanner.html
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gate Scanner - QR Parking</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://unpkg.com/html5-qrcode"></script>
+    <style>
+        .scanner-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 80vh;
+            padding: 2rem;
+        }
+        #qr-reader {
+            width: 100%;
+            max-width: 500px;
+            margin: 2rem 0;
+        }
+        .scan-result {
+            background: white;
+            padding: 2rem;
+            border-radius: 10px;
+            box-shadow: var(--shadow);
+            max-width: 500px;
+            width: 100%;
+            margin-top: 2rem;
+            display: none;
+        }
+        .gate-controls {
+            display: flex;
+            gap: 1rem;
+            margin-top: 2rem;
+        }
+        .gate-btn {
+            padding: 1rem 2rem;
+            font-size: 1.2rem;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-weight: bold;
+        }
+        .entry-btn {
+            background-color: var(--success);
+            color: white;
+        }
+        .exit-btn {
+            background-color: var(--danger);
+            color: white;
+        }
+        .manual-btn {
+            background-color: var(--warning);
+            color: white;
+        }
+        .gate-btn:hover {
+            transform: translateY(-2px);
+            opacity: 0.9;
+        }
+        .gate-status {
+            font-size: 1.5rem;
+            font-weight: bold;
+            margin: 1rem 0;
+            padding: 1rem;
+            border-radius: 5px;
+            text-align: center;
+        }
+        .gate-open {
+            background-color: #d4edda;
+            color: #155724;
+            border: 2px solid #27ae60;
+        }
+        .gate-closed {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 2px solid #e74c3c;
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar">
+        <div class="nav-container">
+            <div class="logo">
+                <i class="fas fa-qrcode"></i>
+                <h1>GATE SCANNER</h1>
+            </div>
+            <ul class="nav-menu">
+                <li><a href="{{ url_for('home') }}">Home</a></li>
+<li><a href="{{ url_for('gate_scanner') }}" class="active">Scanner</a></li>
+<li><a href="{{ url_for('manual_entry') }}">Manual Entry</a></li>
+<li><a href="{{ url_for('admin_login') }}">Admin</a></li>
+
+            </ul>
+        </div>
+    </nav>
+
+    <div class="scanner-container">
+        <h1>QR Code Scanner</h1>
+        <p>Scan QR code for entry or exit</p>
+        
+        <div id="qr-reader"></div>
+        
+        <div class="gate-controls">
+            <button class="gate-btn entry-btn" onclick="simulateEntry()">
+                <i class="fas fa-sign-in-alt"></i> Simulate Entry
+            </button>
+            <button class="gate-btn exit-btn" onclick="simulateExit()">
+                <i class="fas fa-sign-out-alt"></i> Simulate Exit
+            </button>
+            <button class="gate-btn manual-btn" onclick="window.location.href='manual.html'">
+                <i class="fas fa-keyboard"></i> Manual Entry
+            </button>
+        </div>
+        
+        <div id="gateStatus" class="gate-status gate-closed">
+            Gate Status: CLOSED
+        </div>
+        
+        <div id="scanResult" class="scan-result">
+            <h3>Scan Result</h3>
+            <div id="resultContent"></div>
+            <div id="actionButtons" style="margin-top: 1rem;"></div>
+        </div>
+    </div>
+
+    <footer class="footer">
+        <div class="footer-content">
+            <p>&copy; 2025 QR Parking System. All rights reserved.</p>
+            <p>Gate Station: Entry Gate 1</p>
+        </div>
+    </footer>
+
+    <script>
+        let lastScanResult = null;
+        let gateOpen = false;
+        
+        // Initialize QR scanner
+        const html5QrCode = new Html5Qrcode("qr-reader");
+        
+        const config = { 
+            fps: 10, 
+            qrbox: { width: 250, height: 250 } 
+        };
+        
+        // Start scanner
+        html5QrCode.start(
+            { facingMode: "environment" }, 
+            config, 
+            onScanSuccess, 
+            onScanFailure
+        ).catch(err => {
+            console.error("Unable to start scanner:", err);
+            document.getElementById('qr-reader').innerHTML = `
+                <div style="text-align: center; padding: 2rem;">
+                    <i class="fas fa-exclamation-triangle" style="font-size: 3rem; color: var(--warning);"></i>
+                    <p>Camera access required for scanning. Please allow camera permissions.</p>
+                    <p>For demo purposes, use the simulation buttons above.</p>
+                </div>
+            `;
+        });
+        
+        function onScanSuccess(decodedText, decodedResult) {
+            // Stop scanning after successful scan
+            html5QrCode.stop().then(() => {
+                processQRCode(decodedText);
+            }).catch(err => {
+                console.error("Failed to stop scanner:", err);
+            });
+        }
+        
+        function onScanFailure(error) {
+            // Handle scan failure, ignore most errors
+        }
+        
+        function processQRCode(qrData) {
+            lastScanResult = qrData;
+            
+            try {
+                // Try to parse as JSON (for real QR codes)
+                const data = JSON.parse(qrData);
+                displayScanResult(data);
+            } catch {
+                // If not JSON, treat as booking ID
+                const data = {
+                    bookingId: qrData,
+                    vehicle: 'Demo Vehicle',
+                    slot: 'A-1',
+                    entryTime: new Date().toLocaleTimeString()
+                };
+                displayScanResult(data);
+            }
+        }
+        
+        function displayScanResult(data) {
+            document.getElementById('resultContent').innerHTML = `
+                <p><strong>Booking ID:</strong> ${data.bookingId || 'N/A'}</p>
+                <p><strong>Vehicle:</strong> ${data.vehicle || 'Demo Vehicle'}</p>
+                <p><strong>Slot:</strong> ${data.slot || 'A-1'}</p>
+                <p><strong>Time:</strong> ${new Date().toLocaleString()}</p>
+            `;
+            
+            document.getElementById('actionButtons').innerHTML = `
+                <button onclick="openGate()" class="btn btn-success" style="margin-right: 1rem;">
+                    <i class="fas fa-door-open"></i> Open Gate
+                </button>
+                <button onclick="rescan()" class="btn btn-secondary">
+                    <i class="fas fa-redo"></i> Rescan
+                </button>
+            `;
+            
+            document.getElementById('scanResult').style.display = 'block';
+            
+            // Auto-scroll to result
+            document.getElementById('scanResult').scrollIntoView({behavior: 'smooth'});
+        }
+        
+        function openGate() {
+            gateOpen = true;
+            document.getElementById('gateStatus').className = 'gate-status gate-open';
+            document.getElementById('gateStatus').innerHTML = `
+                Gate Status: OPEN <i class="fas fa-check-circle"></i>
+                <p style="font-size: 1rem; margin-top: 0.5rem;">Gate will close automatically in 10 seconds</p>
+            `;
+            
+            // Simulate gate closing after 10 seconds
+            setTimeout(() => {
+                gateOpen = false;
+                document.getElementById('gateStatus').className = 'gate-status gate-closed';
+                document.getElementById('gateStatus').innerHTML = 'Gate Status: CLOSED';
+            }, 10000);
+            
+            // Log the entry/exit
+            logGateActivity('Gate opened for vehicle');
+        }
+        
+        function rescan() {
+            document.getElementById('scanResult').style.display = 'none';
+            
+            // Restart scanner
+            html5QrCode.start(
+                { facingMode: "environment" }, 
+                config, 
+                onScanSuccess, 
+                onScanFailure
+            ).catch(console.error);
+        }
+        
+        function simulateEntry() {
+            const demoData = {
+                bookingId: 'BK' + Date.now(),
+                vehicle: 'KA01AB1234',
+                slot: 'A-1',
+                entryTime: new Date().toLocaleTimeString(),
+                type: 'entry'
+            };
+            
+            displayScanResult(demoData);
+            logGateActivity('Entry simulated for vehicle ' + demoData.vehicle);
+        }
+        
+        function simulateExit() {
+            const demoData = {
+                bookingId: 'BK' + (Date.now() - 1000000),
+                vehicle: 'MH02CD5678',
+                slot: 'A-5',
+                entryTime: '2 hours ago',
+                duration: '2h 15m',
+                amount: '₹120',
+                type: 'exit'
+            };
+            
+            document.getElementById('resultContent').innerHTML = `
+                <p><strong>Booking ID:</strong> ${demoData.bookingId}</p>
+                <p><strong>Vehicle:</strong> ${demoData.vehicle}</p>
+                <p><strong>Slot:</strong> ${demoData.slot}</p>
+                <p><strong>Entry Time:</strong> ${demoData.entryTime}</p>
+                <p><strong>Duration:</strong> ${demoData.duration}</p>
+                <p><strong>Amount Due:</strong> ${demoData.amount}</p>
+            `;
+            
+            document.getElementById('actionButtons').innerHTML = `
+                <button onclick="processPayment()" class="btn btn-success" style="margin-right: 1rem;">
+                    <i class="fas fa-rupee-sign"></i> Process Payment
+                </button>
+                <button onclick="openGate()" class="btn btn-primary" style="margin-right: 1rem;">
+                    <i class="fas fa-door-open"></i> Open Gate (Free Exit)
+                </button>
+                <button onclick="rescan()" class="btn btn-secondary">
+                    <i class="fas fa-redo"></i> Rescan
+                </button>
+            `;
+            
+            document.getElementById('scanResult').style.display = 'block';
+            logGateActivity('Exit simulated for vehicle ' + demoData.vehicle);
+        }
+        
+        function processPayment() {
+            alert('Payment of ₹120 processed successfully!');
+            openGate();
+        }
+        
+        function logGateActivity(activity) {
+            console.log('Gate Activity:', activity, new Date().toLocaleString());
+            // In real app, send to server
+        }
+        
+        // Handle page visibility change
+        document.addEventListener('visibilitychange', function() {
+            if (!document.hidden) {
+                // Page is visible again, restart scanner
+                rescan();
+            }
+        });
+    </script>
+</body>
+</html>
+
+
+slots.html
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Slot Management - QR Parking</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        .slot-management {
+            display: grid;
+            grid-template-columns: 1fr 300px;
+            gap: 2rem;
+        }
+        .slot-map {
+            background: white;
+            padding: 1rem;
+            border-radius: 10px;
+            box-shadow: var(--shadow);
+        }
+        .slot-grid-large {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 0.5rem;
+            margin: 1rem 0;
+        }
+        .slot-large {
+            padding: 1.5rem;
+            text-align: center;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .slot-controls {
+            background: white;
+            padding: 1rem;
+            border-radius: 10px;
+            box-shadow: var(--shadow);
+        }
+        .slot-details {
+            margin: 1rem 0;
+            padding: 1rem;
+            background: #f8f9fa;
+            border-radius: 5px;
+        }
+        .slot-form {
+            margin-top: 2rem;
+        }
+    </style>
+</head>
+<body>
+    <!-- Admin Login Check -->
+    <script>
+        if(localStorage.getItem('adminLoggedIn') !== 'true') {
+            window.location.href = "{{ url_for('admin_login') }}";
+        }
+    </script>
+
+    <div class="dashboard">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div style="padding: 2rem; text-align: center;">
+                <i class="fas fa-user-shield" style="font-size: 3rem; margin-bottom: 1rem;"></i>
+                <h3>Admin Panel</h3>
+            </div>
+            <ul class="sidebar-menu">
+                <li><a href="{{ url_for('dashboard') }}"><i class="fas fa-tachometer-alt"></i> Dashboard</a></li>
+                <li><a href="{{ url_for('slots') }}" class="active"><i class="fas fa-car"></i> Slot Management</a></li>
+                <li><a href="{{ url_for('reports') }}"><i class="fas fa-chart-bar"></i> Reports</a></li>
+                <li><a href="#" onclick="logout()"><i class="fas fa-sign-out-alt"></i> Logout</a></li>
+            </ul>
+        </div>
+
+        <!-- Main Content -->
+        <div class="main-content">
+            <h1>Slot Management</h1>
+            <p>Manage parking slots, view status, and modify configurations</p>
+
+            <div class="slot-management">
+                <!-- Slot Map -->
+                <div class="slot-map">
+                    <h2>Parking Slot Map</h2>
+                    <p>Click on any slot to view or modify details</p>
+                    <div class="slot-grid-large" id="largeSlotGrid"></div>
+
+                    <div style="margin-top: 2rem; display: flex; gap: 1rem; flex-wrap: wrap;">
+                        <div style="display: flex; align-items: center; gap: 5px;">
+                            <div style="width: 20px; height: 20px; background: #d4edda; border: 1px solid #27ae60;"></div>
+                            <span>Available</span>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 5px;">
+                            <div style="width: 20px; height: 20px; background: #f8d7da; border: 1px solid #e74c3c;"></div>
+                            <span>Occupied</span>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 5px;">
+                            <div style="width: 20px; height: 20px; background: #fff3cd; border: 1px solid #f39c12;"></div>
+                            <span>Reserved</span>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 5px;">
+                            <div style="width: 20px; height: 20px; background: #d1ecf1; border: 1px solid #17a2b8;"></div>
+                            <span>Maintenance</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Slot Controls -->
+                <div class="slot-controls">
+                    <h3>Slot Controls</h3>
+                    <div class="slot-details" id="slotDetails">
+                        <p>Click on a slot to view details</p>
+                    </div>
+
+                    <div class="slot-form">
+                        <h4>Modify Slot</h4>
+                        <div class="form-group">
+                            <label>Slot Status</label>
+                            <select id="slotStatus" class="form-control">
+                                <option value="available">Available</option>
+                                <option value="occupied">Occupied</option>
+                                <option value="reserved">Reserved</option>
+                                <option value="maintenance">Under Maintenance</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Vehicle Type</label>
+                            <select id="slotVehicleType" class="form-control">
+                                <option value="both">Both (Two & Four Wheeler)</option>
+                                <option value="two-wheeler">Two Wheeler Only</option>
+                                <option value="four-wheeler">Four Wheeler Only</option>
+                            </select>
+                        </div>
+                        <button onclick="updateSlot()" class="btn btn-primary" style="width: 100%;" id="updateBtn" disabled>Update Slot</button>
+
+                        <div style="margin-top: 2rem;">
+                            <h4>Add New Slot</h4>
+                            <div class="form-group">
+                                <label>Slot Name</label>
+                                <input type="text" id="newSlotName" class="form-control" placeholder="e.g., B-1">
+                            </div>
+                            <button onclick="addSlot()" class="btn btn-success" style="width: 100%;">Add New Slot</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Slot Table -->
+            <div style="margin-top: 3rem;">
+                <h2>All Slots</h2>
+                <div class="table-container">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Slot ID</th>
+                                <th>Status</th>
+                                <th>Vehicle Type</th>
+                                <th>Current Vehicle</th>
+                                <th>Entry Time</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="slotTableBody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let selectedSlotId = null;
+        let slotsData = [];
+
+        // Fetch all slots
+        function fetchSlots() {
+            fetch("{{ url_for('api_get_slots') }}")
+            .then(res => res.json())
+            .then(data => {
+                slotsData = data;
+                renderSlotMap();
+                renderSlotTable();
+            })
+            .catch(err => console.error("Failed to fetch slots:", err));
+        }
+
+        function renderSlotMap() {
+            const grid = document.getElementById('largeSlotGrid');
+            grid.innerHTML = '';
+            slotsData.forEach(slot => {
+                const slotDiv = document.createElement('div');
+                slotDiv.className = `slot-large`;
+
+                let bgColor, borderColor;
+                switch(slot.status) {
+                    case 'available': bgColor='#d4edda'; borderColor='#27ae60'; break;
+                    case 'occupied': bgColor='#f8d7da'; borderColor='#e74c3c'; break;
+                    case 'reserved': bgColor='#fff3cd'; borderColor='#f39c12'; break;
+                    case 'maintenance': bgColor='#d1ecf1'; borderColor='#17a2b8'; break;
+                }
+
+                slotDiv.style.backgroundColor = bgColor;
+                slotDiv.style.border = `2px solid ${borderColor}`;
+                slotDiv.innerHTML = `<h4>${slot.id}</h4><p>${slot.status.charAt(0).toUpperCase() + slot.status.slice(1)}</p>`;
+                slotDiv.onclick = () => selectSlotForEdit(slot.id);
+                grid.appendChild(slotDiv);
+            });
+        }
+
+        function renderSlotTable() {
+            const tbody = document.getElementById('slotTableBody');
+            tbody.innerHTML = '';
+            slotsData.forEach(slot => {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>${slot.id}</td>
+                    <td>${slot.status.charAt(0).toUpperCase()+slot.status.slice(1)}</td>
+                    <td>${slot.vehicleType==='both'?'Both': slot.vehicleType==='two-wheeler'?'Two Wheeler':'Four Wheeler'}</td>
+                    <td>${slot.currentVehicle||'-'}</td>
+                    <td>${slot.entryTime||'-'}</td>
+                    <td>
+                        <button onclick="editSlot('${slot.id}')" class="btn btn-secondary" style="padding:0.3rem 0.6rem;"><i class="fas fa-edit"></i></button>
+                        <button onclick="deleteSlot('${slot.id}')" class="btn btn-danger" style="padding:0.3rem 0.6rem;"><i class="fas fa-trash"></i></button>
+                    </td>
+                `;
+                tbody.appendChild(row);
+            });
+        }
+
+        function selectSlotForEdit(slotId) {
+            selectedSlotId = slotId;
+            const slot = slotsData.find(s => s.id === slotId);
+            if(slot){
+                document.getElementById('slotDetails').innerHTML = `
+                    <h4>${slot.id}</h4>
+                    <p><strong>Status:</strong> ${slot.status.charAt(0).toUpperCase()+slot.status.slice(1)}</p>
+                    <p><strong>Vehicle Type:</strong> ${slot.vehicleType==='both'?'Both': slot.vehicleType==='two-wheeler'?'Two Wheeler':'Four Wheeler'}</p>
+                    <p><strong>Current Vehicle:</strong> ${slot.currentVehicle||'None'}</p>
+                    <p><strong>Entry Time:</strong> ${slot.entryTime||'N/A'}</p>
+                `;
+                document.getElementById('slotStatus').value = slot.status;
+                document.getElementById('slotVehicleType').value = slot.vehicleType;
+                document.getElementById('updateBtn').disabled = false;
+            }
+        }
+
+        function editSlot(slotId) {
+            selectSlotForEdit(slotId);
+            document.querySelector('.slot-controls').scrollIntoView({behavior:'smooth'});
+        }
+
+        function updateSlot() {
+            if(!selectedSlotId) return;
+            const status = document.getElementById('slotStatus').value;
+            const vehicleType = document.getElementById('slotVehicleType').value;
+
+            fetch(`/api/slots/${selectedSlotId}`, {
+                method:'PUT',
+                headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({status, vehicleType})
+            }).then(res => res.json())
+              .then(data => { alert(data.message); fetchSlots(); })
+              .catch(err => console.error(err));
+        }
+
+        function addSlot() {
+            const slotName = document.getElementById('newSlotName').value.trim();
+            if(!slotName){ alert('Please enter a slot name'); return; }
+
+            fetch("/api/slots", {
+                method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({id:slotName, status:'available', vehicleType:'both'})
+            }).then(res => res.json())
+              .then(data => { alert(data.message); fetchSlots(); document.getElementById('newSlotName').value=''; })
+              .catch(err => console.error(err));
+        }
+
+        function deleteSlot(slotId) {
+            if(!confirm(`Delete slot ${slotId}?`)) return;
+            fetch(`/api/slots/${slotId}`, {method:'DELETE'})
+            .then(res => res.json())
+            .then(data => { alert(data.message); fetchSlots(); })
+            .catch(err => console.error(err));
+        }
+
+        function logout() {
+            localStorage.removeItem('adminLoggedIn');
+            window.location.href = "{{ url_for('admin_login') }}";
+        }
+
+        window.onload = fetchSlots;
+    </script>
+</body>
+</html>
+
+
+
+
+
+i have uploaded my py and html files find the error and correct it
+
